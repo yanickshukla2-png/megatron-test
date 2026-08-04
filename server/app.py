@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 import os
 import tempfile
@@ -6,6 +6,7 @@ import uuid
 from dotenv import load_dotenv
 import openai
 import azure.cognitiveservices.speech as speechsdk
+from pydub import AudioSegment
 
 load_dotenv()
 
@@ -20,6 +21,24 @@ if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION or not OPENAI_API_KEY:
 openai.api_key = OPENAI_API_KEY
 
 app = FastAPI(title="Megatron Test — Voice Assistant Prototype")
+
+
+def convert_to_wav(in_path: str) -> str:
+    """Convert any supported audio file to a mono 16kHz WAV file (PCM 16-bit) using pydub/ffmpeg.
+
+    Returns the path to the converted WAV file. The caller is responsible for removing the file.
+    """
+    try:
+        audio = AudioSegment.from_file(in_path)
+    except Exception as e:
+        raise RuntimeError(f"Audio conversion failed (ffmpeg may be missing or file is invalid): {e}")
+
+    # Normalize: mono, 16 kHz, 16-bit samples
+    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+
+    out_path = os.path.join(tempfile.gettempdir(), f"converted_{uuid.uuid4().hex}.wav")
+    audio.export(out_path, format="wav")
+    return out_path
 
 
 def transcribe_audio_with_azure(wav_path: str) -> str:
@@ -60,17 +79,13 @@ def query_openai_system_reply(user_text: str) -> str:
 
 
 @app.post("/voice")
-async def voice_endpoint(audio: UploadFile = File(...)):
-    """Accepts an uploaded audio file (WAV) and returns a synthesized WAV reply.
+async def voice_endpoint(background_tasks: BackgroundTasks, audio: UploadFile = File(...)):
+    """Accepts an uploaded audio file and returns a synthesized WAV reply.
 
     Form field: audio (file)
     Returns: audio/wav file
     """
     suffix = os.path.splitext(audio.filename)[1] or ".wav"
-    if suffix.lower() not in [".wav", ".mp3", ".m4a", ".flac"]:
-        # We'll accept common formats but Azure SDK examples use WAV. If you upload other formats, conversion may be required.
-        pass
-
     tmp_dir = tempfile.gettempdir()
     in_path = os.path.join(tmp_dir, f"upload_{uuid.uuid4().hex}{suffix}")
     out_path = os.path.join(tmp_dir, f"reply_{uuid.uuid4().hex}.wav")
@@ -79,11 +94,14 @@ async def voice_endpoint(audio: UploadFile = File(...)):
         contents = await audio.read()
         f.write(contents)
 
+    converted_path = None
     try:
-        # NOTE: Azure recognizer examples typically expect WAV with compatible sample rate.
-        transcript = transcribe_audio_with_azure(in_path)
+        # Convert any incoming audio to WAV 16kHz mono for Azure compatibility
+        converted_path = convert_to_wav(in_path)
+        transcript = transcribe_audio_with_azure(converted_path)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription error: {e}")
+        # provide helpful error message (do not leak secrets)
+        raise HTTPException(status_code=500, detail=f"Transcription/conversion error: {e}")
 
     try:
         reply_text = query_openai_system_reply(transcript)
@@ -94,5 +112,11 @@ async def voice_endpoint(audio: UploadFile = File(...)):
         synthesize_speech_with_azure(reply_text, out_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS error: {e}")
+
+    # Schedule temp file cleanup after response is sent
+    background_tasks.add_task(lambda p: os.remove(p) if os.path.exists(p) else None, in_path)
+    if converted_path:
+        background_tasks.add_task(lambda p: os.remove(p) if os.path.exists(p) else None, converted_path)
+    background_tasks.add_task(lambda p: os.remove(p) if os.path.exists(p) else None, out_path)
 
     return FileResponse(out_path, media_type="audio/wav", filename="reply.wav")
