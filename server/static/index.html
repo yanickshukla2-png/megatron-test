@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Megatron Test — Voice Client</title>
+  </head>
+  <body>
+    <h1>Megatron Test — Simple Voice Client</h1>
+    <p>Click and hold the Record button to record audio, then release to send it to the server.</p>
+
+    <button id="recordBtn">Hold to Record</button>
+    <p id="status"></p>
+
+    <script>
+      let mediaRecorder;
+      let audioChunks = [];
+      const recordBtn = document.getElementById('recordBtn');
+      const status = document.getElementById('status');
+
+      async function startRecording() {
+        status.textContent = 'Requesting microphone...';
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorder = new MediaRecorder(stream);
+        audioChunks = [];
+        mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+        mediaRecorder.start();
+        status.textContent = 'Recording...';
+      }
+
+      async function stopRecording() {
+        return new Promise(resolve => {
+          mediaRecorder.onstop = async () => {
+            const blob = new Blob(audioChunks, { type: 'audio/webm' });
+            status.textContent = 'Sending audio to server...';
+
+            const fd = new FormData();
+            fd.append('audio', blob, 'recording.webm');
+
+            try {
+              const resp = await fetch('https://localhost:8000/voice', {
+                method: 'POST',
+                body: fd,
+                // If using a self-signed cert in the browser, you'll need to trust it first.
+              });
+              if (!resp.ok) {
+                const errText = await resp.text();
+                status.textContent = 'Server error: ' + errText;
+                resolve();
+                return;
+              }
+              const audioBlob = await resp.blob();
+              const url = URL.createObjectURL(audioBlob);
+              const audio = new Audio(url);
+              audio.play();
+              status.textContent = 'Received reply and playing audio.';
+            } catch (e) {
+              status.textContent = 'Request failed: ' + e;
+            }
+            resolve();
+          };
+          mediaRecorder.stop();
+        });
+      }
+
+      recordBtn.addEventListener('mousedown', async () => { await startRecording(); });
+      recordBtn.addEventListener('mouseup', async () => { await stopRecording(); });
+      // For touch devices
+      recordBtn.addEventListener('touchstart', async (e) => { e.preventDefault(); await startRecording(); });
+      recordBtn.addEventListener('touchend', async (e) => { e.preventDefault(); await stopRecording(); });
+    </script>
+  </body>
+</html>
